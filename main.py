@@ -22,6 +22,10 @@ STAY_TIME_THRESHOLD_MS = 20 * 60 * 1000
 # A gap this long between consecutive samples is treated as tracking having
 # paused/stopped (app closed, phone off), i.e. an implicit departure.
 STAY_MAX_GAP_MS = 60 * 60 * 1000
+# Google Places has no "exact address" filter, only radius search. Kept tight
+# so it captures businesses co-located at the same building/address rather
+# than others nearby on the same block.
+NEARBY_BUSINESS_RADIUS_M = 15
 
 def verify_api_key(x_api_key: str = Header(...)):
     if x_api_key != API_KEY:
@@ -40,6 +44,11 @@ class LocationBatch(BaseModel):
 class LocationRecord(LocationPoint):
     id: int
 
+class Business(BaseModel):
+    name: str
+    types: List[str]
+    place_id: str
+
 class VisitedPlace(BaseModel):
     id: int
     latitude: float
@@ -48,6 +57,7 @@ class VisitedPlace(BaseModel):
     departure_time: int
     point_count: int
     address: Optional[str]
+    businesses: List[Business] = []
 
 # Create SQLite tables if they don't exist
 def init_db():
@@ -82,6 +92,15 @@ def init_db():
             candidate_start_id INTEGER
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS visited_place_businesses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            visited_place_id INTEGER NOT NULL REFERENCES visited_places(id),
+            name TEXT NOT NULL,
+            types TEXT,
+            place_id TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -96,7 +115,13 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     a = sin(dphi / 2) ** 2 + cos(phi1) * cos(phi2) * sin(dlambda / 2) ** 2
     return 2 * r * asin(sqrt(a))
 
-def reverse_geocode(lat: float, lon: float) -> Optional[str]:
+def reverse_geocode(lat: float, lon: float) -> Optional[dict]:
+    """
+    Returns {"address", "latitude", "longitude"} using Google's resolved
+    location for the matched address (usually rooftop-accurate), which is
+    more representative of the actual building than a raw noisy GPS fix.
+    Returns None if no key is set or the lookup fails/finds nothing.
+    """
     if not GOOGLE_MAPS_API_KEY:
         return None
     try:
@@ -107,9 +132,63 @@ def reverse_geocode(lat: float, lon: float) -> Optional[str]:
         )
         resp.raise_for_status()
         results = resp.json().get("results") or []
-        return results[0]["formatted_address"] if results else None
+        if not results:
+            return None
+        top = results[0]
+        location = top["geometry"]["location"]
+        return {
+            "address": top["formatted_address"],
+            "latitude": location["lat"],
+            "longitude": location["lng"],
+        }
     except Exception:
         return None
+
+def fetch_nearby_businesses(lat: float, lon: float) -> list:
+    """
+    Returns businesses at (lat, lon) via Places API (New) Nearby Search
+    within NEARBY_BUSINESS_RADIUS_M, as
+    [{"name", "types", "place_id", "address", "latitude", "longitude"}, ...].
+    Each place's own location/address is included so callers can pick the
+    closest one instead of making a separate Geocoding call. Empty list if
+    no key is set or the lookup fails.
+    """
+    if not GOOGLE_MAPS_API_KEY:
+        return []
+    try:
+        resp = requests.post(
+            "https://places.googleapis.com/v1/places:searchNearby",
+            headers={
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
+                "X-Goog-FieldMask": "places.displayName,places.types,places.id,places.formattedAddress,places.location",
+            },
+            json={
+                "maxResultCount": 20,
+                "locationRestriction": {
+                    "circle": {
+                        "center": {"latitude": lat, "longitude": lon},
+                        "radius": NEARBY_BUSINESS_RADIUS_M,
+                    }
+                },
+            },
+            timeout=5,
+        )
+        resp.raise_for_status()
+        places = resp.json().get("places") or []
+        return [
+            {
+                "name": p["displayName"]["text"],
+                "types": p.get("types", []),
+                "place_id": p["id"],
+                "address": p.get("formattedAddress"),
+                "latitude": p["location"]["latitude"],
+                "longitude": p["location"]["longitude"],
+            }
+            for p in places
+        ]
+    except Exception:
+        return []
 
 def detect_and_store_stay_points(conn: sqlite3.Connection):
     """
@@ -172,7 +251,30 @@ def detect_and_store_stay_points(conn: sqlite3.Connection):
             lon = sum(p[2] for p in cluster) / len(cluster)
             arrival = cluster[0][3]
             departure = cluster[-1][3]
-            address = reverse_geocode(lat, lon)
+
+            # Try Places first: it's one call that gives us both the
+            # businesses list and (via each result's own location) an
+            # address, so a stay with anything nearby needs no separate
+            # Geocoding call. Only fall back to Geocoding when Places finds
+            # nothing within NEARBY_BUSINESS_RADIUS_M.
+            businesses = fetch_nearby_businesses(lat, lon)
+            if businesses:
+                closest = min(
+                    businesses,
+                    key=lambda b: haversine_m(lat, lon, b["latitude"], b["longitude"]),
+                )
+                address = closest["address"]
+                lat = closest["latitude"]
+                lon = closest["longitude"]
+            else:
+                geocoded = reverse_geocode(lat, lon)
+                if geocoded:
+                    address = geocoded["address"]
+                    lat = geocoded["latitude"]
+                    lon = geocoded["longitude"]
+                else:
+                    address = None
+
             cursor.execute(
                 """
                 INSERT INTO visited_places
@@ -181,6 +283,20 @@ def detect_and_store_stay_points(conn: sqlite3.Connection):
                 """,
                 (lat, lon, arrival, departure, len(cluster), address),
             )
+            visited_place_id = cursor.lastrowid
+            for business in businesses:
+                cursor.execute(
+                    """
+                    INSERT INTO visited_place_businesses (visited_place_id, name, types, place_id)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        visited_place_id,
+                        business["name"],
+                        ",".join(business["types"]),
+                        business["place_id"],
+                    ),
+                )
             i = j
         else:
             # points[i] can never join a cluster with points[j] or beyond
@@ -270,10 +386,14 @@ def get_visited_places(start: int, end: int):
         (start, end),
     )
     rows = cursor.fetchall()
-    conn.close()
 
-    return [
-        {
+    places = []
+    for r in rows:
+        biz_rows = cursor.execute(
+            "SELECT name, types, place_id FROM visited_place_businesses WHERE visited_place_id = ?",
+            (r[0],),
+        ).fetchall()
+        places.append({
             "id": r[0],
             "latitude": r[1],
             "longitude": r[2],
@@ -281,7 +401,12 @@ def get_visited_places(start: int, end: int):
             "departure_time": r[4],
             "point_count": r[5],
             "address": r[6],
-        }
-        for r in rows
-    ]
+            "businesses": [
+                {"name": b[0], "types": b[1].split(",") if b[1] else [], "place_id": b[2]}
+                for b in biz_rows
+            ],
+        })
+
+    conn.close()
+    return places
 #uv run uvicorn main:app --host 0.0.0.0 --port 8000 --reload
