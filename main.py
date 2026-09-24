@@ -72,6 +72,14 @@ def init_db():
             accuracy REAL NOT NULL
         )
     """)
+    # Guards against the client resending an already-uploaded batch (e.g. a
+    # retry that fires even though the server already processed it): without
+    # this, executemany() blindly inserts fresh duplicate rows, which then
+    # get reclustered into duplicate visited_places entries.
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_locations_dedup
+        ON locations (latitude, longitude, timestamp, accuracy)
+    """)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS visited_places (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -325,13 +333,15 @@ def receive_locations(batch: LocationBatch):
     conn = sqlite3.connect("locations.db")
     cursor = conn.cursor()
 
-    # Efficient bulk insert using executemany
+    # Efficient bulk insert using executemany. OR IGNORE silently drops any
+    # point that matches an already-stored (lat, lon, timestamp, accuracy),
+    # so a resent batch is a no-op instead of creating duplicate rows.
     records = [
         (loc.latitude, loc.longitude, loc.timestamp, loc.accuracy)
         for loc in batch.locations
     ]
     cursor.executemany(
-        "INSERT INTO locations (latitude, longitude, timestamp, accuracy) VALUES (?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO locations (latitude, longitude, timestamp, accuracy) VALUES (?, ?, ?, ?)",
         records
     )
     conn.commit()
