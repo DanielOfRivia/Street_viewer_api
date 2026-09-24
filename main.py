@@ -1,11 +1,12 @@
 import os
 import sqlite3
+import threading
 from math import asin, cos, radians, sin, sqrt
 from typing import List, Optional
 
 import requests
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel
 
 load_dotenv()
@@ -26,6 +27,8 @@ STAY_MAX_GAP_MS = 60 * 60 * 1000
 # so it captures businesses co-located at the same building/address rather
 # than others nearby on the same block.
 NEARBY_BUSINESS_RADIUS_M = 15
+
+stay_detection_lock = threading.Lock()
 
 def verify_api_key(x_api_key: str = Header(...)):
     if x_api_key != API_KEY:
@@ -90,6 +93,12 @@ def init_db():
             point_count INTEGER NOT NULL,
             address TEXT
         )
+    """)
+    # Keyed on arrival/departure rather than lat/lon because the stored
+    # coordinates are replaced by Google's resolved location.
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_visited_places_stay
+        ON visited_places (arrival_time, departure_time)
     """)
     # Tracks the first location row of the stay-point candidate that is
     # still "open" (hasn't been broken by a point outside STAY_DIST_THRESHOLD_M
@@ -285,14 +294,17 @@ def detect_and_store_stay_points(conn: sqlite3.Connection):
 
             cursor.execute(
                 """
-                INSERT INTO visited_places
+                INSERT OR IGNORE INTO visited_places
                     (latitude, longitude, arrival_time, departure_time, point_count, address)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (lat, lon, arrival, departure, len(cluster), address),
             )
+            # lastrowid isn't reset by an ignored insert, so check rowcount
+            # instead or the businesses would attach to the previous place.
+            inserted = cursor.rowcount == 1
             visited_place_id = cursor.lastrowid
-            for business in businesses:
+            for business in businesses if inserted else []:
                 cursor.execute(
                     """
                     INSERT INTO visited_place_businesses (visited_place_id, name, types, place_id)
@@ -305,6 +317,9 @@ def detect_and_store_stay_points(conn: sqlite3.Connection):
                         business["place_id"],
                     ),
                 )
+            # Commit per place so the write lock isn't held across the next
+            # cluster's Google calls, which would block concurrent uploads.
+            conn.commit()
             i = j
         else:
             # points[i] can never join a cluster with points[j] or beyond
@@ -321,11 +336,23 @@ def detect_and_store_stay_points(conn: sqlite3.Connection):
     )
     conn.commit()
 
+def run_stay_detection():
+    #  Fix for race condition where multiple threads could run this concurrently and step on each other.
+    #  Assumes a single uvicorn process.
+    with stay_detection_lock:
+        conn = sqlite3.connect("locations.db")
+        try:
+            detect_and_store_stay_points(conn)
+        finally:
+            conn.close()
+
 @app.post("/api/v1/locations", status_code=status.HTTP_201_CREATED, dependencies=[Depends(verify_api_key)])
-def receive_locations(batch: LocationBatch):
+def receive_locations(batch: LocationBatch, background_tasks: BackgroundTasks):
     """
     Synchronous 'def' handler: FastAPI runs this inside an external thread pool
     so the blocking SQLite disk operations don't freeze the main event loop.
+    Clustering (which makes slow Google API calls) runs after the response is
+    sent, so the client isn't left waiting long enough to time out and retry.
     """
     if not batch.locations:
         return {"status": "success", "received": 0}
@@ -345,9 +372,9 @@ def receive_locations(batch: LocationBatch):
         records
     )
     conn.commit()
-
-    detect_and_store_stay_points(conn)
     conn.close()
+
+    background_tasks.add_task(run_stay_detection)
 
     return {"status": "success", "received": len(batch.locations)}
 
