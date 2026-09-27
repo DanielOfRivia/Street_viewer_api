@@ -406,10 +406,12 @@ def get_locations(start: int, end: int):
 @app.get("/api/v1/visited-places", response_model=List[VisitedPlace], dependencies=[Depends(verify_api_key)])
 def get_visited_places(start: int, end: int):
     """
-    Returns derived stay points (clustered visited places) with arrival_time
-    in [start, end] (unix epoch, same units as LocationPoint.timestamp),
-    ordered oldest to newest. A place you're currently still at won't appear
-    until a later point outside STAY_DIST_THRESHOLD_M confirms departure.
+    Returns derived stay points (clustered visited places) that overlap
+    [start, end] (unix epoch, same units as LocationPoint.timestamp), ordered
+    oldest to newest. A stay extending past either edge is clipped to it, so
+    a stay across midnight appears on both days with each day's portion. A
+    place you're currently still at won't appear until a later point outside
+    STAY_DIST_THRESHOLD_M confirms departure.
     """
     conn = sqlite3.connect("locations.db")
     cursor = conn.cursor()
@@ -417,15 +419,25 @@ def get_visited_places(start: int, end: int):
         """
         SELECT id, latitude, longitude, arrival_time, departure_time, point_count, address
         FROM visited_places
-        WHERE arrival_time BETWEEN ? AND ?
+        WHERE arrival_time <= ? AND departure_time >= ?
         ORDER BY arrival_time ASC
         """,
-        (start, end),
+        (end, start),
     )
     rows = cursor.fetchall()
 
     places = []
     for r in rows:
+        arrival = max(r[3], start)
+        departure = min(r[4], end)
+        point_count = r[5]
+        if (arrival, departure) != (r[3], r[4]):
+            # A stay's points are a contiguous run in time, so the points in
+            # the clipped window are exactly this day's share of the stay.
+            point_count = cursor.execute(
+                "SELECT COUNT(*) FROM locations WHERE timestamp BETWEEN ? AND ?",
+                (arrival, departure),
+            ).fetchone()[0]
         biz_rows = cursor.execute(
             "SELECT name, types, place_id FROM visited_place_businesses WHERE visited_place_id = ?",
             (r[0],),
@@ -434,9 +446,9 @@ def get_visited_places(start: int, end: int):
             "id": r[0],
             "latitude": r[1],
             "longitude": r[2],
-            "arrival_time": r[3],
-            "departure_time": r[4],
-            "point_count": r[5],
+            "arrival_time": arrival,
+            "departure_time": departure,
+            "point_count": point_count,
             "address": r[6],
             "businesses": [
                 {"name": b[0], "types": b[1].split(",") if b[1] else [], "place_id": b[2]}
