@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import threading
+from collections import Counter
 from math import asin, cos, radians, sin, sqrt
 from typing import List, Optional
 
@@ -23,6 +24,18 @@ STAY_TIME_THRESHOLD_MS = 20 * 60 * 1000
 # A gap this long between consecutive samples is treated as tracking having
 # paused/stopped (app closed, phone off), i.e. an implicit departure.
 STAY_MAX_GAP_MS = 60 * 60 * 1000
+# The client only reports a fix after moving MIN_UPDATE_DISTANCE_METERS, so
+# sitting still indoors can produce multi-hour silences. A gap longer than
+# STAY_MAX_GAP_MS is still bridged if the points on either side of it are
+# this close together (we never saw you leave), up to STAY_MAX_BRIDGED_GAP_MS
+# so that e.g. a day with tracking off doesn't merge two home stays.
+STAY_GAP_BRIDGE_DIST_M = 50
+STAY_MAX_BRIDGED_GAP_MS = 12 * 60 * 60 * 1000
+# A new stay within this distance of an already-known place reuses that
+# place's address/coordinates/businesses instead of a fresh Places lookup,
+# which would otherwise pick whichever business is closest to this stay's
+# slightly different centroid and label the same building differently.
+PLACE_REUSE_RADIUS_M = 30
 # Google Places has no "exact address" filter, only radius search. Kept tight
 # so it captures businesses co-located at the same building/address rather
 # than others nearby on the same block.
@@ -207,12 +220,80 @@ def fetch_nearby_businesses(lat: float, lon: float) -> list:
     except Exception:
         return []
 
+def find_known_place(cursor: sqlite3.Cursor, lat: float, lon: float) -> Optional[tuple]:
+    """
+    Returns (id, latitude, longitude, address) of a visited place with an
+    address within PLACE_REUSE_RADIUS_M of (lat, lon), or None. Prefers the
+    address most places in range share (then the closest), since one building
+    may already carry several labels from before and "closest" alone would
+    keep flipping between them.
+    """
+    dlat = PLACE_REUSE_RADIUS_M / 111_320
+    dlon = PLACE_REUSE_RADIUS_M / (111_320 * cos(radians(lat)))
+    candidates = cursor.execute(
+        """
+        SELECT id, latitude, longitude, address FROM visited_places
+        WHERE address IS NOT NULL
+          AND latitude BETWEEN ? AND ?
+          AND longitude BETWEEN ? AND ?
+        """,
+        (lat - dlat, lat + dlat, lon - dlon, lon + dlon),
+    ).fetchall()
+    in_range = [
+        c for c in candidates
+        if haversine_m(lat, lon, c[1], c[2]) <= PLACE_REUSE_RADIUS_M
+    ]
+    if not in_range:
+        return None
+    address_counts = Counter(c[3] for c in in_range)
+    return min(
+        in_range,
+        key=lambda c: (-address_counts[c[3]], haversine_m(lat, lon, c[1], c[2])),
+    )
+
+def resolve_place(cursor: sqlite3.Cursor, lat: float, lon: float) -> tuple:
+    """
+    Returns (latitude, longitude, address, businesses) for a stay centred on
+    (lat, lon). Reuses an already-known place within PLACE_REUSE_RADIUS_M so
+    repeat visits get a consistent label; otherwise looks it up via Google.
+    """
+    known = find_known_place(cursor, lat, lon)
+    if known:
+        place_id, lat, lon, address = known
+        biz_rows = cursor.execute(
+            "SELECT name, types, place_id FROM visited_place_businesses WHERE visited_place_id = ?",
+            (place_id,),
+        ).fetchall()
+        businesses = [
+            {"name": b[0], "types": b[1].split(",") if b[1] else [], "place_id": b[2]}
+            for b in biz_rows
+        ]
+        return lat, lon, address, businesses
+
+    # Try Places first: it's one call that gives us both the businesses
+    # list and (via each result's own location) an address, so a stay with
+    # anything nearby needs no separate Geocoding call. Only fall back to
+    # Geocoding when Places finds nothing within NEARBY_BUSINESS_RADIUS_M.
+    businesses = fetch_nearby_businesses(lat, lon)
+    if businesses:
+        closest = min(
+            businesses,
+            key=lambda b: haversine_m(lat, lon, b["latitude"], b["longitude"]),
+        )
+        return closest["latitude"], closest["longitude"], closest["address"], businesses
+
+    geocoded = reverse_geocode(lat, lon)
+    if geocoded:
+        return geocoded["latitude"], geocoded["longitude"], geocoded["address"], []
+    return lat, lon, None, []
+
 def detect_and_store_stay_points(conn: sqlite3.Connection):
     """
     Incremental stay-point detection (Li et al.): walks points in
     chronological order, growing a candidate cluster while each new point
     stays within STAY_DIST_THRESHOLD_M of the cluster's first point and
-    within STAY_MAX_GAP_MS of the previous point. When a point breaks either
+    within STAY_MAX_GAP_MS of the previous point (or a longer gap that
+    resumes at the same spot, see STAY_GAP_BRIDGE_DIST_M). When a point breaks either
     condition, the cluster is finalized (and reverse-geocoded) if it spans at
     least STAY_TIME_THRESHOLD_MS, and a new candidate starts at the breaking
     point. Only reprocesses points since the last still-open candidate,
@@ -245,11 +326,16 @@ def detect_and_store_stay_points(conn: sqlite3.Connection):
         j = i + 1
         while j < n:
             gap = points[j][3] - points[j - 1][3]
-            if gap > STAY_MAX_GAP_MS:
-                # Tracking was paused/stopped for a long stretch: treat this
-                # as an implicit departure rather than bridging the cluster
-                # across it (otherwise repeat visits to the same spot, e.g.
-                # home, would all merge into one multi-day "stay").
+            if gap > STAY_MAX_GAP_MS and not (
+                gap <= STAY_MAX_BRIDGED_GAP_MS
+                and haversine_m(points[j - 1][1], points[j - 1][2], points[j][1], points[j][2])
+                <= STAY_GAP_BRIDGE_DIST_M
+            ):
+                # Tracking was paused/stopped for a long stretch, or we
+                # resurfaced somewhere else: treat this as an implicit
+                # departure rather than bridging the cluster across it
+                # (otherwise repeat visits to the same spot, e.g. home,
+                # would all merge into one multi-day "stay").
                 break
             dist = haversine_m(points[i][1], points[i][2], points[j][1], points[j][2])
             if dist > STAY_DIST_THRESHOLD_M:
@@ -269,28 +355,7 @@ def detect_and_store_stay_points(conn: sqlite3.Connection):
             arrival = cluster[0][3]
             departure = cluster[-1][3]
 
-            # Try Places first: it's one call that gives us both the
-            # businesses list and (via each result's own location) an
-            # address, so a stay with anything nearby needs no separate
-            # Geocoding call. Only fall back to Geocoding when Places finds
-            # nothing within NEARBY_BUSINESS_RADIUS_M.
-            businesses = fetch_nearby_businesses(lat, lon)
-            if businesses:
-                closest = min(
-                    businesses,
-                    key=lambda b: haversine_m(lat, lon, b["latitude"], b["longitude"]),
-                )
-                address = closest["address"]
-                lat = closest["latitude"]
-                lon = closest["longitude"]
-            else:
-                geocoded = reverse_geocode(lat, lon)
-                if geocoded:
-                    address = geocoded["address"]
-                    lat = geocoded["latitude"]
-                    lon = geocoded["longitude"]
-                else:
-                    address = None
+            lat, lon, address, businesses = resolve_place(cursor, lat, lon)
 
             cursor.execute(
                 """
